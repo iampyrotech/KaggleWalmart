@@ -1,0 +1,125 @@
+---
+title: "Walmart Sales Forecasting"
+format: pdf
+editor: visual
+---
+
+## Libraries
+
+```{r}
+library(tidyverse)
+library(vroom)
+library(readr)    
+library(GGally)
+library(patchwork)
+library(tidymodels)
+library(recipes)
+library(lubridate)
+```
+
+## Data
+
+```{r}
+test <- vroom('/Users/chasenielsen/Documents/Stat348/KaggleWalmart/test.csv')
+train <- vroom('/Users/chasenielsen/Documents/Stat348/KaggleWalmart/train.csv')
+stores <- vroom('/Users/chasenielsen/Documents/Stat348/KaggleWalmart/stores.csv')
+features <- vroom('/Users/chasenielsen/Documents/Stat348/KaggleWalmart/features.csv')
+```
+
+```{r}
+# Clean merge that prevents IsHoliday.x / IsHoliday.y problems
+train_full <- train %>%
+  left_join(stores, by = "Store") %>%
+  left_join(
+    features %>% select(-IsHoliday),      # drop the second IsHoliday BEFORE joining
+    by = c("Store", "Date")
+  )
+
+# Same for test
+test_full <- test %>%
+  left_join(stores, by = "Store") %>%
+  left_join(
+    features %>% select(-IsHoliday),
+    by = c("Store", "Date")
+  )
+```
+
+```{r}
+holiday_lookup <- tibble(
+  Date = as.Date(c(
+    "2010-02-12","2011-02-11","2012-02-10","2013-02-08",  # Super Bowl
+    "2010-09-10","2011-09-09","2012-09-07","2013-09-06",  # Labor Day
+    "2010-11-26","2011-11-25","2012-11-23","2013-11-29",  # Thanksgiving
+    "2010-12-31","2011-12-30","2012-12-28","2013-12-27"   # Christmas
+  )),
+  Holiday = c(rep("SuperBowl", 4),
+              rep("LaborDay", 4),
+              rep("Thanksgiving", 4),
+              rep("Christmas", 4))
+)
+```
+
+```{r}
+train_full <- train_full %>%
+  left_join(holiday_lookup, by = "Date") %>%
+  mutate(Holiday = ifelse(IsHoliday, Holiday, "None"))
+
+test_full <- test_full %>%
+  left_join(holiday_lookup, by = "Date") %>%
+  mutate(Holiday = ifelse(IsHoliday, Holiday, "None"))
+```
+
+```{r}
+train_full <- train_full %>%
+  mutate(
+    doy = yday(Date),
+    sinDOY = sin(2*pi * doy/365),
+    cosDOY = cos(2*pi * doy/365)
+  )
+
+test_full <- test_full %>%
+  mutate(
+    doy = yday(Date),
+    sinDOY = sin(2*pi * doy/365),
+    cosDOY = cos(2*pi * doy/365)
+  )
+```
+
+```{r}
+library(tidymodels)
+
+rec <- recipe(Weekly_Sales ~ ., data = train_full) %>%
+  update_role(Date, new_role = "ID") %>%     
+  step_mutate(IsHoliday = as.numeric(IsHoliday)) %>%       
+  step_impute_median(all_numeric_predictors()) %>%       
+  step_impute_mode(all_nominal_predictors()) %>%         
+  step_dummy(all_nominal(), -all_outcomes()) %>%         
+  step_zv(all_predictors()) %>%                         
+  step_normalize(all_numeric_predictors())
+
+lasso_spec <- linear_reg(
+  penalty = tune(),
+  mixture = tune()
+) %>%
+  set_engine("glmnet") %>%
+  set_mode("regression")
+
+wf <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(lasso_spec)
+
+set.seed(123)
+folds <- vfold_cv(train_full, v = 5)
+
+tuned <- tune_grid(
+  wf,
+  resamples = folds,
+  grid = 20
+)
+
+best_params <- select_best(tuned, metric = "rmse")
+
+final_wf <- finalize_workflow(wf, best_params)
+
+fit_glmnet <- final_wf %>% fit(train_full)
+```
