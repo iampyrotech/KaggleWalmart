@@ -15,6 +15,7 @@ library(patchwork)
 library(tidymodels)
 library(recipes)
 library(lubridate)
+library(prophet)
 ```
 
 ## Data
@@ -123,3 +124,112 @@ final_wf <- finalize_workflow(wf, best_params)
 
 fit_glmnet <- final_wf %>% fit(train_full)
 ```
+
+```{r}
+# 1. Predict using trained glmnet model
+test_pred <- predict(fit_glmnet, test_full)
+
+# 2. Build submission
+submission <- test_full %>%
+  mutate(Id = paste(Store, Dept, Date, sep = "_")) %>%
+  select(Id) %>%
+  bind_cols(test_pred) %>%
+  rename(Weekly_Sales = .pred)
+
+# 3. Write CSV for Kaggle
+write.csv(submission, "submission.csv", row.names = FALSE)
+show_best(tuned, metric = "rmse")
+```
+
+```{r}
+# find combos with most observations
+top_combos <- train_full %>%
+  count(Store, Dept, sort = TRUE) %>%
+  slice(1:2)
+
+top_combos
+# use these:
+combo_list <- top_combos %>% select(Store, Dept)
+
+fit_forecast_prophet <- function(store, dept, train_df, test_df){
+
+  # filter combo
+  sd_train <- train_df %>%
+    filter(Store == store, Dept == dept) %>%
+    transmute(
+      ds = as.Date(Date),
+      y  = Weekly_Sales,
+      Temperature,
+      Fuel_Price,
+      CPI,
+      Unemployment,
+      sinDOY,
+      cosDOY
+    )
+
+  sd_test <- test_df %>%
+    filter(Store == store, Dept == dept) %>%
+    transmute(
+      ds = as.Date(Date),
+      Temperature,
+      Fuel_Price,
+      CPI,
+      Unemployment,
+      sinDOY,
+      cosDOY
+    )
+
+  # quick impute for prophet (needs no NA in regressors)
+  for (col in names(sd_train)[-c(1,2)]) {
+    med <- median(sd_train[[col]], na.rm = TRUE)
+    sd_train[[col]][is.na(sd_train[[col]])] <- med
+    sd_test[[col]][is.na(sd_test[[col]])] <- med
+  }
+
+  # fit prophet with regressors
+  m <- prophet(
+      yearly.seasonality = TRUE,
+      weekly.seasonality = FALSE,
+      daily.seasonality  = FALSE
+    ) %>%
+    add_regressor("Temperature") %>%
+    add_regressor("Fuel_Price") %>%
+    add_regressor("CPI") %>%
+    add_regressor("Unemployment") %>%
+    add_regressor("sinDOY") %>%
+    add_regressor("cosDOY")
+
+  m <- fit.prophet(m, sd_train)
+
+  fitted_vals <- predict(m, sd_train)
+  test_preds  <- predict(m, sd_test)
+
+  # plot
+  p <- ggplot() +
+    geom_line(data = sd_train,
+              aes(x = ds, y = y, color = "Data")) +
+    geom_line(data = fitted_vals,
+              aes(x = as.Date(ds), y = yhat, color = "Fitted")) +
+    geom_line(data = test_preds,
+              aes(x = as.Date(ds), y = yhat, color = "Forecast")) +
+    scale_color_manual(values = c("Data"="black", "Fitted"="blue", "Forecast"="red")) +
+    labs(
+      title = paste0("Store ", store, " Dept ", dept),
+      x = NULL, y = "Weekly Sales", color = ""
+    ) +
+    theme_minimal()
+
+  list(model = m, plot = p, fitted = fitted_vals, forecast = test_preds)
+}
+
+results <- combo_list %>%
+  mutate(res = purrr::map2(Store, Dept,
+                          ~fit_forecast_prophet(.x, .y, train_full, test_full)))
+
+p1 <- results$res[[1]]$plot
+p2 <- results$res[[2]]$plot
+
+two_panel_plot <- p1 / p2   # stack vertically; use p1 | p2 for side-by-side
+two_panel_plot
+```
+
